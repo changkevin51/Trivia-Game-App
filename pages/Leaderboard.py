@@ -1,3 +1,3 @@
-from Trivia import show_leaderboard
+from app import show_leaderboard
 
 show_leaderboard()
