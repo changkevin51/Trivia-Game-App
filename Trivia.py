@@ -8,8 +8,32 @@ import html
 import time 
 from os.path import exists
 import base64
+from sqlalchemy import create_engine, Column, Integer, String, Float
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from datetime import datetime
 
-# Set some configs about the app
+Base = declarative_base()
+DATABASE_URL = st.secrets["postgresql"]["connection_string"]
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+class Leaderboard(Base):
+    __tablename__ = "leaderboard"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, index=True)
+    score = Column(Integer)
+    timestamp = Column(String)
+
+Base.metadata.create_all(bind=engine)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
 st.set_page_config(
     page_title="Trivia Game",
     page_icon="🧊",
@@ -31,8 +55,6 @@ def autoplay_audio(file_path: str):
             unsafe_allow_html=True,
         )
 
-
-# Initialize session state variables
 if 'score' not in st.session_state:
     st.session_state.score = 0
 if 'total_questions' not in st.session_state:
@@ -59,7 +81,8 @@ if st.session_state.df.empty:
     st.session_state.df = df
 else:
     df = st.session_state.df
-
+if 'leaderboard_submitted' not in st.session_state:
+    st.session_state.leaderboard_submitted = False
 
 def request_total_question():
     url_total_questions = "https://opentdb.com/api_count_global.php"
@@ -134,27 +157,28 @@ def fetch_and_prepare_questions():
 def select_category_and_difficulty(df):
     st.write("# Trivia Game")
 
-    categories = df['Category'].unique()
-    difficulties = df['Difficulty'].unique()
+    categories = df['category'].unique()
+    difficulties = df['difficulty'].unique()
 
     st.write("## Choose Categories:")
-    selected_categories = st.multiselect("Select one or more categories", options=categories.tolist(), default=categories.tolist())
+    
+    if 'all_selected' not in st.session_state:
+        st.session_state.all_selected = False
+
+    if st.button("Select/Deselect All Categories"):
+        st.session_state.all_selected = not st.session_state.all_selected
+
+    if st.session_state.all_selected:
+        selected_categories = categories.tolist()
+    else:
+        selected_categories = []
+
+    selected_categories = st.pills("Select one or more categories", options=categories.tolist(), selection_mode="multi", default=selected_categories)
     st.session_state.selected_categories = selected_categories
 
     st.write("## Choose Difficulties:")
     selected_difficulties = st.multiselect("Select one or more difficulties", options=difficulties.tolist(), default=difficulties.tolist())
     st.session_state.selected_difficulties = selected_difficulties
-
-def get_random_question(df):
-    filtered_df = df[df['Category'].isin(st.session_state.selected_categories) & df['Difficulty'].isin(st.session_state.selected_difficulties)]
-    filtered_df = filtered_df[~filtered_df.index.isin(st.session_state.used_questions)]
-    if filtered_df.empty:
-        st.write("No more questions available for the selected categories and difficulties.")
-        return None
-    question = filtered_df.sample(n=1)
-    st.session_state.current_question = question.iloc[0]
-    st.session_state.used_questions.add(question.index[0])
-    return st.session_state.current_question
 
 def display_sidebar(df):
     total_questions = st.session_state.total_questions
@@ -184,38 +208,20 @@ def display_sidebar(df):
     st.sidebar.caption("A project by Kevin Chang")
         
 def transform_data(df):
-    # Create new column option1 from column correct answers
     df['option1'] = df['correct_answer'].copy()
-    # Create three new option columns from incorrect answers
     df[['option2', 'option3', 'option4']] = df["incorrect_answers"].apply(pd.Series)
-    # Drop some columns
     df = df.drop(['incorrect_answers'], axis=1)
-    # Shuffle the options
     df['options'] = df[['option1', 'option2', 'option3', 'option4']].values.tolist()
     df['options'] = df['options'].apply(lambda x: [opt for opt in x if pd.notnull(opt)])
     df['options'] = df['options'].apply(random.sample, k=len)
     df.to_csv('questionsList.csv', index=False)
     return df
 
-def select_category_and_difficulty(df):
-    st.write("# Trivia Game")
-
-    categories = df['category'].unique()
-    difficulties = df['difficulty'].unique()
-
-    st.write("## Choose Categories:")
-    selected_categories = st.pills("Select one or more categories", options=categories.tolist(), selection_mode="multi", default=categories.tolist())
-    st.session_state.selected_categories = selected_categories
-
-    st.write("## Choose Difficulties:")
-    selected_difficulties = st.multiselect("Select one or more difficulties", options=difficulties.tolist(), default=difficulties.tolist())
-    st.session_state.selected_difficulties = selected_difficulties
-
 def get_random_question(df):
     filtered_df = df[df['category'].isin(st.session_state.selected_categories) & df['difficulty'].isin(st.session_state.selected_difficulties)]
     filtered_df = filtered_df[~filtered_df.index.isin(st.session_state.used_questions)]
     if filtered_df.empty:
-        st.write("No more questions available for the selected categories and difficulties.")
+        st.write("Please select at least one category and difficulty.")
         return None
     question = filtered_df.sample(n=1)
     st.session_state.current_question = question.iloc[0]
@@ -239,12 +245,32 @@ def check_answer(selected_answer, question):
         st.session_state.last_answer_correct = False
         st.warning(f"Incorrect. The correct answer was: {correct_answer}. You have {st.session_state.score} out of {st.session_state.total_questions} points.")
 
+def save_score(username, score):
+    from sqlalchemy.orm import Session
+    db = Session(bind=engine)
+    new_entry = Leaderboard(username=username, score=score, timestamp=str(datetime.now()))
+    db.add(new_entry)
+    db.commit()
+    db.close()
+    st.success(f"Score saved for {username}!")
+
+def show_leaderboard():
+    db = Session(bind=engine)
+    results = db.query(Leaderboard).order_by(Leaderboard.score.desc()).limit(10).all()
+    db.close()
+    
+    st.header("🏆 Global Leaderboard")
+    if results:
+        leaderboard_df = pd.DataFrame([{"Name": r.username, "Score": r.score, "Time": pd.to_datetime(r.timestamp).strftime('%Y-%m-%d %H:%M:%S')} for r in results])
+        st.table(leaderboard_df)
+    else:
+        st.write("No scores yet! Be the first to play.")
+
 def main():
-    file_exists = exists('questionsList.csv')
-    if not file_exists:
+    if not exists('questionsList.csv'):
         st.info("#### Please press the button to load the questions!")
         if st.sidebar.button('Fetch Questions', key='fetch_questions_button'):
-            with st.spinner('Please wait loading the questions...This may take several minutes!'):
+            with st.spinner('Loading the questions... This may take several minutes!'):
                 df = fetch_and_prepare_questions()
                 st.session_state.df = df
                 st.success("Questions loaded successfully!")
@@ -260,51 +286,55 @@ def main():
         display_sidebar(df)
         select_category_and_difficulty(df)
 
-        # Initialize session state variables if not present
         if 'current_question' not in st.session_state:
             st.session_state.current_question = None
         if 'answer_submitted' not in st.session_state:
             st.session_state.answer_submitted = False
-        if 'show_feedback' not in st.session_state:
-            st.session_state.show_feedback = False
+        if 'leaderboard_submitted' not in st.session_state:
+            st.session_state.leaderboard_submitted = False
 
-        # Always display the 'Next Question' button
-        next_question_clicked = st.button('Next Question', key='next_question_button')
-
-        if next_question_clicked:
-            # If 'Next Question' is clicked, reset states or fetch a new question
+        if st.button('Next Question', key='next_question_button'):
             st.session_state.current_question = None
             st.session_state.answer_submitted = False
-            st.session_state.show_feedback = False
 
         if st.session_state.current_question is None:
-            # Fetch a new question
             question = get_random_question(df)
             if question is not None:
                 st.session_state.current_question = question
             else:
                 st.write("No more questions available. You can adjust your filters or restart the game.")
-                return  # Exit if no questions are left
+                return
 
         if st.session_state.current_question is not None:
             question = st.session_state.current_question
 
             if not st.session_state.answer_submitted:
-                # Display the current question and options
                 with st.form("Answer Form"):
                     selected_answer = display_question(question)
                     submit_button = st.form_submit_button("Submit")
                     if submit_button:
                         check_answer(selected_answer, question)
                         st.session_state.answer_submitted = True
-                        st.session_state.show_feedback = True
             else:
-                # Show feedback and prompt to proceed
-                if st.session_state.show_feedback:
-                    st.write("You can click 'Next Question' to proceed or skip to another question.")
-    
-    
+                st.write("Click 'Next Question' to proceed.")
 
+        if st.session_state.total_questions > 0:
+            if not st.session_state.leaderboard_submitted:
+                st.write("### Enter your name to save your score on the leaderboard")
+                st.warning("⚠️ Once you submit, you cannot change your score or name.")
+                
+                with st.form("Leaderboard Form"):
+                    username = st.text_input("Enter your name:")
+                    submit_button = st.form_submit_button("Submit Score")
+
+                    if submit_button:
+                        if username.strip():
+                            save_score(username, st.session_state.score)
+                            st.session_state.leaderboard_submitted = True
+                        else:
+                            st.warning("Please enter a valid name.")
+            else:
+                st.info("Your score has been submitted. Thank you for playing!")
 
 if __name__ == '__main__':
     main()
